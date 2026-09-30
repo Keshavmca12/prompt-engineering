@@ -1,0 +1,156 @@
+ROLE
+You are a senior Java engineer building "upyog-mcp-server": an MCP (Model Context Protocol)
+server that lets the UPYOG assistant and other AI agents perform citizen/employee tasks on
+UPYOG (DIGIT-based). It is a thin, secure, DESCRIPTOR-DRIVEN orchestration layer. All
+business rules stay in the existing UPYOG services.
+
+DESIGN PRINCIPLE
+Do NOT create one MCP tool per REST endpoint. Expose a small fixed set of generic tools
+(below). Module-specific knowledge lives in per-service descriptor files, so adding a new
+module (Trade License, Water & Sewerage, ...) means adding a descriptor, not writing tools.
+
+STEP 0 - DISCOVER BEFORE CODING
+I will provide API specs for: pgr-services, property-services, billing-service,
+advertisement-service and the community hall (venue) booking service. Read them plus the
+UPYOG repo/MDMS config and produce a short discovery report: for each operation, the exact
+endpoint, request/response models, required fields, workflow business service and action
+names, MDMS masters, and role-actions needed. Also document: how the Zuul gateway
+authenticates and injects user info into RequestInfo, how egov-accesscontrol authorizes,
+how egov-user validates a token, and which org.egov.tracer version is compatible with our
+Spring Boot version. Flag ambiguity instead of guessing. Wait for my review before
+implementing write operations.
+
+STACK
+Java 17, Spring Boot 3.2.x, Maven. Spring AI MCP server starter (WebMVC) or the official
+MCP Java SDK (verify Streamable HTTP support; stdio only as a dev profile). RestClient,
+Resilience4j, Micrometer + OpenTelemetry, structured JSON logs, Caffeine, Bean Validation,
+Jackson + JsonPath for descriptor templating, JSON Schema validation, WireMock + JUnit 5.
+Stateless: no in-memory session state.
+
+REUSE EXISTING UPYOG INFRASTRUCTURE
+1. Every downstream call goes THROUGH THE GATEWAY with the end user's auth-token. The
+   gateway does authentication and RBAC via egov-accesscontrol. No shared superuser token.
+   Do not build your own permission model (tool-list filtering is UX only).
+2. Validate the Bearer token at the MCP edge via egov-user; read uuid, roles, tenant.
+   Login/OTP is not this server's job.
+3. Build RequestInfo server-side (apiId, ver, ts, msgId, authToken, userInfo, correlationId).
+   The agent can never supply user identity or RequestInfo. tenantId may be an argument but
+   must be validated against the user's allowed tenants.
+4. Tracing: use org.egov.tracer if compatible, otherwise replicate its correlation-ID
+   behaviour. Propagate the correlation ID on every downstream call, log line and audit
+   event.
+5. Reuse egov-mdms-service, egov-localization, egov-workflow-v2, billing-service.
+
+GENERIC TOOLS (fixed set)
+- list_services: services and operations the caller may use (role-filtered).
+- describe_operation(service, operation): returns the input JSON schema, required fields,
+  allowed filters, examples, and whether confirmation is required.
+- lookup_master(name, filters): read-only MDMS masters from an allow-list (complaint types,
+  venues, ad spaces, etc.), cached.
+- search(service, filters, page, size): read-only; filters validated against the descriptor.
+- get_status(service, id): status, last action, key timeline, SLA if available.
+- prepare_action(service, operation, payload, idempotencyKey): validates against the
+  descriptor schema, returns a human-readable summary of exactly what will happen plus a
+  confirmationToken. Executes nothing.
+- confirm_action(confirmationToken): executes the prepared action.
+- get_pending_bill(businessService, consumerCode, tenantId): fetch pending bill via
+  billing-service; explicit result when nothing is due.
+- get_payment_link(businessService, consumerCode, tenantId): verify a payable bill exists,
+  then return a direct link built from a CONFIGURABLE URL template (placeholders for
+  consumerCode, tenantId, businessService). NEVER initiate, complete or store payments.
+  Confirm the real citizen pay-page path from the UI code.
+Each tool has MCP annotations (readOnlyHint / destructiveHint / idempotentHint). Keep
+descriptions precise so the LLM picks the right tool.
+
+PHASE 1 SERVICES (descriptors to write)
+- pgr: operations create (complaint), search, status.
+- property: operations search (pending bill and payment link use the generic bill tools with
+  the PT business service).
+- advertisement (advertisement-service): operations create (booking), search.
+- venue-booking (community hall booking service): operations create, search, cancel.
+  Cancel is destructive: the prepare step must show what the backend says about
+  cancellation/refund terms; never compute refunds locally.
+If any create flow needs document upload, do not handle files in v1: return a clear message
+with a deep link to the UI for that step.
+
+SERVICE DESCRIPTOR (YAML/JSON, one per service, validated at startup)
+Each descriptor declares: id, displayName, description (for the LLM), allowedRoles hint,
+and per operation:
+- type (search | status | create | cancel | update), read-only/destructive flags,
+  requiresConfirmation
+- downstream method + gateway path, request template (with placeholders for RequestInfo,
+  tenantId, and payload fields), and pagination mapping
+- flattened, LLM-friendly input JSON schema (additionalProperties=false, enums, examples)
+- friendly-filter to downstream-param mapping
+- response projection (fields returned), id field, status field, timeline source
+- PII masking rules (JSONPath + mask type)
+- billing businessService and workflow business service where relevant
+- role-actions URLs this operation needs in MDMS (used to generate a checklist)
+Rules: the agent chooses only registry service/operation names. It never supplies a URL,
+HTTP method, or raw request body. Unknown fields are rejected. Provide a Java
+ServiceAdapter interface as an escape hatch for operations the template engine cannot
+express (for example cancel implemented as _update with a workflow action). Provide a
+tool to lint descriptors and a startup failure if one is invalid. Optionally, behind a
+disabled-by-default feature flag, generate per-operation tools from descriptors.
+
+WRITE SAFETY
+- prepare_action never writes. confirm_action executes only with a valid token.
+- confirmationToken is HMAC-signed and binds userId + service + operation + hash of the
+  payload + expiry (default 5 min). Single use via Redis if available, otherwise short TTL
+  plus idempotency key.
+- Idempotency key on every create/cancel, passed downstream where supported and
+  de-duplicated locally otherwise.
+- Tool descriptions must instruct the agent to obtain explicit user confirmation before
+  calling confirm_action.
+
+DATA PROTECTION AND SAFETY
+- Mask PII (mobile, Aadhaar, email, full address where not needed, owner names in
+  searches) in output and never log bodies containing PII.
+- Free text from citizens/employees (complaint descriptions, remarks, comments) is untrusted:
+  return it in a clearly delimited data field and never let it influence tool behaviour.
+  Never echo tokens or internal URLs.
+- Follow DPDP principles: minimisation, purpose limitation, retention limits on audit logs.
+
+RELIABILITY AND LIMITS
+- Per-operation timeouts (reads about 8s, writes about 20s), retries only for idempotent
+  reads, circuit breaker per downstream, per-client and per-user rate limits.
+- Hard caps on page size, response size and input length.
+- Uniform structured errors: code, message, retryable flag, suggested next step. No stack
+  traces or raw downstream bodies.
+- Audit event for every call: user uuid, client id, service, operation, tenant, redacted
+  args, outcome, latency, correlation ID.
+- Health/readiness endpoints, graceful shutdown, config via env/ConfigMap, Dockerfile and
+  Helm/K8s manifests consistent with other UPYOG services.
+
+NON-GOALS (v1)
+File uploads, payment initiation or completion, login/OTP, employee approval/workflow
+actions, refund calculation, duplicating any business rule from UPYOG services.
+
+PROJECT STRUCTURE
+config/ | tools/ (the generic tools only) | registry/ (descriptor loader, validator,
+template engine, ServiceAdapter SPI) | descriptors/ (pgr.yaml, property.yaml,
+advertisement.yaml, venue-booking.yaml) | client/ (gateway client, RequestInfo builder,
+error mapping) | mapper/ (projection + PII masking) | guard/ (confirmation tokens,
+idempotency, rate limits) | audit/ | resources/
+
+TESTING AND DELIVERABLES
+- WireMock contract tests per descriptor operation against the real request/response shapes.
+- Unit tests: token signing, masking, prepare/confirm, tenant validation, descriptor
+  validation, rejection of unknown fields and attempts to pass URLs/bodies.
+- Eval set of about 30 realistic agent prompts (English and Hindi) with expected tool
+  calls and arguments, including negatives (wrong tenant, expired token, injection text in
+  a complaint).
+- README: tool catalog, descriptor authoring guide (how to add a new module), config
+  properties, auth flow, and the generated role-actions checklist per service.
+- Small commits: (1) discovery report, (2) auth/RequestInfo/tracing/audit skeleton with
+  the descriptor engine and one read operation end to end, (3) remaining read operations
+  and bill/payment-link tools, (4) write operations with prepare/confirm, (5) hardening.
+
+ACCEPTANCE CRITERIA
+- Adding a new module requires only a descriptor (plus role-actions), no new tool code,
+  in the common case.
+- A citizen token can only see and do what the gateway/access control already allows.
+- No call ever accepts agent-supplied user identity, RequestInfo, URL, method or raw body.
+- get_payment_link returns a working link and never triggers a payment.
+- Every write needs a valid confirmation token bound to the exact payload.
+- Correlation ID appears in MCP logs, audit and downstream gateway logs.
